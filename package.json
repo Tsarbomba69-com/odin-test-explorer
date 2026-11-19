@@ -1,0 +1,54 @@
+{
+  "name": "odin-test-explorer",
+  "displayName": "Odin Test Explorer",
+  "description": "Discover and run Odin @(test) procedures directly in VS Code's Test Explorer.",
+  "version": "0.1.0",
+  "publisher": "your-publisher-name",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Testing",
+    "Programming Languages"
+  ],
+  "activationEvents": [
+    "workspaceContains:**/*.odin",
+    "onLanguage:odin"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "Odin Test Explorer",
+      "properties": {
+        "odinTestExplorer.odinPath": {
+          "type": "string",
+          "default": "odin",
+          "description": "Path to the Odin compiler executable."
+        },
+        "odinTestExplorer.trackMemory": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable Odin's built-in test runner memory tracking (ODIN_TEST_TRACK_MEMORY)."
+        },
+        "odinTestExplorer.extraArgs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Additional CLI arguments passed to `odin test` (e.g., [\"-collection:shared=src/shared\"])."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.4.0"
+  }
+}

@@ -3,7 +3,11 @@
   "displayName": "Odin Test Explorer",
   "description": "Discover and run Odin @(test) procedures directly in VS Code's Test Explorer.",
   "version": "0.1.0",
-  "publisher": "your-publisher-name",
+  "publisher": "Hendrick-Dias",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Tsarbomba69-com/odin-test-explorer.git"
+  },
   "engines": {
     "vscode": "^1.85.0"
   },

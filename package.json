@@ -37,6 +37,11 @@
           },
           "default": [],
           "description": "Additional CLI arguments passed to `odin test` (e.g., [\"-collection:shared=src/shared\"])."
+        },
+        "odinTestExplorer.debuggerType": {
+          "type": "string",
+          "default": "lldb",
+          "description": "VS Code debug adapter type used to launch tests from the Debug profile (for example, lldb or cppdbg)."
         }
       }
     }

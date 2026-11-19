@@ -1,6 +1,8 @@
 import * as vscode from 'vscode';
 import { execFile } from 'child_process';
 import * as path from 'path';
+import * as os from 'os';
+import * as fs from 'fs/promises';
 
 interface TestMetadata {
     type: 'package' | 'file' | 'test';
@@ -23,6 +25,12 @@ export function activate(context: vscode.ExtensionContext) {
         vscode.TestRunProfileKind.Run,
         (request, token) => runTests(controller, request, token),
         true
+    );
+
+    controller.createRunProfile(
+        'Debug Odin Tests',
+        vscode.TestRunProfileKind.Debug,
+        (request, token) => debugTests(controller, request, token)
     );
 
     // Watch for file creation, edits, and deletions
@@ -338,6 +346,195 @@ async function runTests(
     }
 
     run.end();
+}
+
+/**
+ * Picks the debug adapter type. An explicit user/workspace setting always wins.
+ * Otherwise use the adapter that can actually read the debug info Odin emits on
+ * this platform: Odin writes a PDB on Windows, which the Visual Studio debugger
+ * (`cppvsdbg`, from the C/C++ extension) binds breakpoints against reliably,
+ * whereas CodeLLDB (`lldb`) frequently leaves them unbound. DWARF on Linux/macOS
+ * works well with `lldb`.
+ *
+ * `inspect()` is used instead of `get()` so a default declared in package.json
+ * does not mask the platform-specific choice.
+ */
+function resolveDebuggerType(config: vscode.WorkspaceConfiguration): string {
+    const info = config.inspect<string>('debuggerType');
+    const explicit = info?.workspaceFolderValue ?? info?.workspaceValue ?? info?.globalValue;
+    if (explicit) {
+        return explicit;
+    }
+    return process.platform === 'win32' ? 'cppvsdbg' : 'lldb';
+}
+
+/** Build selected tests without running them, then launch the executable through
+ * a VS Code native debugger so source breakpoints bind to the test process. */
+async function debugTests(
+    controller: vscode.TestController,
+    request: vscode.TestRunRequest,
+    token: vscode.CancellationToken
+): Promise<void> {
+    const run = controller.createTestRun(request);
+    const excludeSet = new Set(request.exclude ?? []);
+    const leaves: vscode.TestItem[] = [];
+    const collect = (item: vscode.TestItem) => {
+        if (excludeSet.has(item)) return;
+        if (testMeta.get(item)?.type === 'test') {
+            leaves.push(item);
+            run.enqueued(item);
+        } else {
+            item.children.forEach(collect);
+        }
+    };
+    if (request.include?.length) request.include.forEach(collect);
+    else controller.items.forEach(collect);
+
+    const byPackage = new Map<string, vscode.TestItem[]>();
+    for (const item of leaves) {
+        const pkgDir = testMeta.get(item)!.pkgDir;
+        const group = byPackage.get(pkgDir) ?? [];
+        group.push(item);
+        byPackage.set(pkgDir, group);
+    }
+
+    const config = vscode.workspace.getConfiguration('odinTestExplorer');
+    const odinPath = config.get<string>('odinPath', 'odin');
+    const trackMemory = config.get<boolean>('trackMemory', true);
+    const extraArgs = config.get<string[]>('extraArgs', []);
+    const debuggerType = resolveDebuggerType(config);
+
+    for (const [pkgDir, items] of byPackage) {
+        if (token.isCancellationRequested) {
+            items.forEach(item => run.skipped(item));
+            continue;
+        }
+        items.forEach(item => run.started(item));
+
+        const testNames = items.map(item => testMeta.get(item)?.procName).filter((name): name is string => !!name);
+        let tempDir: string | undefined;
+        try {
+            tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'odin-test-explorer-'));
+            const executable = path.join(tempDir, process.platform === 'win32' ? 'odin-tests.exe' : 'odin-tests');
+            const args = [
+                'build', pkgDir, '-build-mode:test', '-debug', '-o:none',
+                `-out:${executable}`,
+                '-define:ODIN_TEST_FANCY=false',
+                `-define:ODIN_TEST_TRACK_MEMORY=${trackMemory}`,
+                '-define:ODIN_TEST_THREADS=1',
+                `-define:ODIN_TEST_NAMES=${testNames.join(',')}`,
+                ...extraArgs,
+            ];
+            const build = await execOdin(odinPath, args, pkgDir, token);
+            const buildOutput = [build.stdout, build.stderr].filter(Boolean).join('\n');
+            if (buildOutput) run.appendOutput(buildOutput.replace(/\r?\n/g, '\r\n') + '\r\n');
+            if (token.isCancellationRequested) {
+                items.forEach(item => run.skipped(item));
+                continue;
+            }
+            if (build.exitCode !== 0) {
+                items.forEach(item => run.errored(item, new vscode.TestMessage(buildOutput.trim() || 'Failed to build test executable for debugging.')));
+                continue;
+            }
+
+            const sessionName = `Debug Odin Tests (${path.basename(pkgDir)})`;
+            const folder = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(pkgDir));
+            const stdoutPath = path.join(tempDir, 'stdout.log');
+            const stderrPath = path.join(tempDir, 'stderr.log');
+            let resolveTermination: (() => void) | undefined;
+            const terminated = new Promise<void>(resolve => { resolveTermination = resolve; });
+            const terminationSubscription = vscode.debug.onDidTerminateDebugSession(session => {
+                if (session.name === sessionName) {
+                    terminationSubscription.dispose();
+                    resolveTermination?.();
+                }
+            });
+            const cancelSubscription = token.onCancellationRequested(() => {
+                const activeSession = vscode.debug.activeDebugSession;
+                if (activeSession?.name === sessionName) {
+                    void vscode.debug.stopDebugging(activeSession);
+                }
+            });
+            // CodeLLDB otherwise sends the debuggee's stdio straight to its
+            // terminal/debug console. File-backed streams let the Test Results
+            // item show output while the debug session is running.
+            const stopOutputCapture = debuggerType === 'lldb'
+                ? tailDebugOutput([stdoutPath, stderrPath], run, items.length === 1 ? items[0] : undefined)
+                : undefined;
+            const started = await vscode.debug.startDebugging(folder, {
+                type: debuggerType,
+                request: 'launch',
+                name: sessionName,
+                program: executable,
+                cwd: pkgDir,
+                args: [],
+                stopOnEntry: false,   // lldb / CodeLLDB
+                stopAtEntry: false,   // cppvsdbg / cppdbg
+                ...(debuggerType === 'lldb' ? {
+                    terminal: 'integrated',
+                    stdio: [null, stdoutPath, stderrPath],
+                } : {}),
+                ...(debuggerType === 'cppdbg' || debuggerType === 'cppvsdbg' ? {
+                    // cpptools exposes inferior output in its Debug Console and,
+                    // with externalConsole disabled, the integrated terminal.
+                    externalConsole: false,
+                    logging: { programOutput: true },
+                } : {}),
+            });
+            if (!started) {
+                terminationSubscription.dispose();
+                cancelSubscription.dispose();
+                await stopOutputCapture?.();
+                items.forEach(item => run.errored(item, new vscode.TestMessage(
+                    `Could not start debugger type '${debuggerType}'. Install a compatible debug adapter (cppvsdbg needs the C/C++ extension on Windows; lldb needs CodeLLDB) and set odinTestExplorer.debuggerType.`
+                )));
+            } else {
+                await terminated;
+                cancelSubscription.dispose();
+                await stopOutputCapture?.();
+                items.forEach(item => run.skipped(item));
+            }
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            items.forEach(item => run.errored(item, new vscode.TestMessage(message)));
+        } finally {
+            if (tempDir) await fs.rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
+        }
+    }
+    run.end();
+}
+
+function tailDebugOutput(
+    files: string[],
+    run: vscode.TestRun,
+    test?: vscode.TestItem
+): () => Promise<void> {
+    let stopped = false;
+    const offsets = files.map(() => 0);
+    const readNewOutput = async () => {
+        for (let i = 0; i < files.length; i++) {
+            try {
+                const contents = await fs.readFile(files[i]);
+                if (contents.length <= offsets[i]) continue;
+                const text = contents.subarray(offsets[i]).toString('utf8');
+                offsets[i] = contents.length;
+                if (text) run.appendOutput(text.replace(/\r?\n/g, '\r\n'), undefined, test);
+            } catch {
+                // A redirected stream file may not exist until its first write.
+            }
+        }
+    };
+    const polling = (async () => {
+        while (!stopped) {
+            await readNewOutput();
+            if (!stopped) await new Promise(resolve => setTimeout(resolve, 100));
+        }
+        await readNewOutput();
+    })();
+    return async () => {
+        stopped = true;
+        await polling;
+    };
 }
 
 interface ExecResult {
